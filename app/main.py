@@ -2550,37 +2550,36 @@ def read_snapshot(
 ):
     """公开读取：凭有效令牌或多快照共享凭证返回脱敏正文。
 
-    先对快照行加锁再判定有效性，使读取与永久撤回由数据库行锁串行化：
-    撤回提交后才开始的读取在此看到 withdrawn_at 非空，直接返回模糊 403，
-    既不返回正文也不执行计数 UPDATE（不消耗任何额度）。
+    资格判定时刻的统一原则：**不在取快照锁时缓存服务端时间**——本请求随后仍
+    可能在记录/冻结行（与冻结、换发等事务竞争）与凭证行（与并发读取、撤销、
+    换发竞争）上排队等待，等待期间可能跨过阅览时段开放/截止、凭证到期、记录
+    冻结或定时撤回计划到点。因此所有时间敏感判定（定时撤回、冻结期、阅览
+    时段、凭证有效期）与扣次一律使用**相关行锁全部等待结束后**重新读取的
+    服务端时刻：跨过任一界限的请求统一沿用模糊 403，不扣次数、不写成功审计。
 
-    随后对该快照所属记录的行加锁并核对当前冻结期，使读取与临时冻结/解除
-    同样串行化：冻结提交后才开始的读取在此看到未解除冻结期，沿用与撤回完全
-    一致的模糊 403（不透露冻结或原因），不扣次数、不写成功读取审计；解除提交
-    后开始的读取按各自凭证的既有资格继续判定。冻结覆盖该记录现有及冻结期间
-    新发布的全部快照；共享凭证中属于其他记录的快照不受影响、仍可读取。
+    加锁与判定顺序（锁序恒为“快照行 -> 记录行 -> 凭证行 -> 冻结行”，与冻结、
+    换发、撤销等事务保持同序，不会死锁）：
 
-    外部阅览时段（随快照首次发布固定，不可变）：带时段的快照仅在
-    [window_open_at, window_close_at) 内可读取——开放时刻起含、截止时刻前不含，
-    一律以服务端资格判定时刻为准；开放前或截止后的读取沿用同一模糊 403，
-    不扣次数、不写成功读取审计。时段是每快照属性：同一条共享凭证读取清单内
-    其他快照不受窗口外快照影响。无时段快照（维护侧两字段均为 null）不受限制。
+    1. 快照行加锁；不存在 -> 模糊 403，不触碰任何计数；
+    2. 记录行加锁；
+    3. 凭证行加锁（优先按单快照令牌定位；不存在再按多快照共享凭证定位），
+       获锁后用 populate_existing 刷新为排队期间已提交的最新状态；
+    4. 当前冻结期行加锁（不存在活跃冻结期时立即返回空）；
+    5. **此时**读取一次服务端时刻 now，作为本请求唯一的资格判定时刻；
+    6. 在快照行锁内以 now 惰性结算定时撤回计划：等待期间到点的计划在本次请求内
+       按预定时刻与计划原因完成撤回，结算先提交，随后本请求按“已撤回快照”
+       模糊 403（不扣次、不写成功审计）；
+    7. 再次核对撤回状态、当前冻结期与阅览时段
+       [window_open_at, window_close_at)：开放时刻起含、截止时刻前不含；
+       无时段快照（两列均为 NULL）恒通过；窗口外模糊 403、不扣次、不写审计；
+    8. 凭证有效性与额度在已锁定的凭证行上以同一份 now 判定（未撤销、未换发、
+       未到期、（不限次或）额度未耗尽；共享凭证还要求快照在绑定清单内），
+       不合格模糊 403 且不消耗额度；
+    9. 合格则在同一事务原子完成扣次与成功读取审计事件（事件时间取 now），
+       任一失败整体回滚；响应与原有脱敏正文完全一致。
 
-    单快照令牌：有效性判定与次数消耗由同一条条件 UPDATE 原子完成
-    （未撤销、未到期、(不限次或 reads_used < max_reads)）。
-
-    多快照共享凭证：额外要求该快照在凭证绑定清单内，且凭证未撤销、未到期、
-    共享额度未耗尽；计数条件合并在同一条 JOIN 条件 UPDATE 中原子完成：
-    - 凭证不存在、与清单不匹配、快照不在清单内、已撤销、已到期、额度耗尽 -> rowcount=0，
-      统一返回模糊 403，且这些请求不消耗共享额度；
-    - 清单内某项快照后来被撤回：只拒绝该项（快照行锁阶段即 403），不扣额度，
-      其他项仍可凭同一凭证读取；
-    - 到期、撤销或额度耗尽时全部拒绝。
-
-    每次成功读取（无论令牌还是共享凭证）都在本次额度扣减的同一事务内追加一条
-    不可变审计事件（事件标识、快照、时间、凭证类型与稳定换发链标识，绝无凭证明文）：
-    事件与计数同生共死，任一失败整体回滚；上述所有失败路径在写事件之前即结束，
-    不产生任何审计事件。
+    共享凭证的时段/撤回/冻结是每快照属性：清单内某项不可读只拒绝该项（不扣
+    共享额度），同一凭证读取清单内其他快照不受影响。
     """
     snapshot = db.execute(
         select(Snapshot).where(Snapshot.id == snapshot_id).with_for_update()
@@ -2589,32 +2588,37 @@ def read_snapshot(
         # 不区分“快照不存在 / 已撤回 / 已冻结 / 阅览窗口外 / 令牌或凭证无效 / 已撤销 / 已过期 / 次数用尽 / 不在清单”，
         # 快照不存在时直接拒绝，不触碰任何读取计数，也不写审计事件。
         db.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, detail="snapshot unavailable"
-        )
-    read_now = datetime.now(timezone.utc)
-    # 定时撤回计划到点即在此（快照行锁内）惰性结算：结算提交后本次读取按既有
-    # “已撤回快照”路径处理——模糊 403、不扣单令牌或共享凭证额度、不写成功审计。
-    if snapshot.withdrawn_at is None:
-        _settle_snapshot_withdrawal_plans(db, snapshot, read_now)
-        if snapshot.withdrawn_at is not None:
-            db.commit()
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN, detail="snapshot unavailable"
-            )
-    if snapshot.withdrawn_at is not None:
-        # 已撤回（手动撤回或到点计划）：不触碰任何读取计数，也不写审计事件。
-        db.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, detail="snapshot unavailable"
-        )
-    # 再锁快照所属记录行并在锁内核对当前冻结期：冻结操作先锁记录行再插入冻结行，
-    # 与读取在此串行化；冻结提交后才开始的读取必定看到未解除冻结期并模糊拒绝，
-    # 不扣任何额度、不写成功读取审计（解除只恢复原本仍有效的读取资格）。
-    # 锁序恒为“快照行 -> 记录行 -> 冻结行”，与冻结/换发等事务保持同序，不会死锁。
+        raise _snapshot_unavailable()
+
+    # 下面依次取齐本请求依赖的全部行锁；取锁期间不缓存、不判定任何时刻：
+    # 锁序恒为“快照行 -> 记录行 -> 凭证行 -> 冻结行”，与冻结/解除、换发、撤销
+    # 等事务保持同序（它们不需要本事务后取得的锁），不会形成锁序环。
+
+    # 记录行：与冻结/解除及其他读取在记录锁上串行化。
     db.execute(
         select(Record.id).where(Record.id == snapshot.record_id).with_for_update()
     )
+
+    # 凭证行：优先按既有单快照令牌定位；令牌不存在再按多快照共享凭证定位。
+    # 获锁后必须 populate_existing 刷新——行锁可能排队到并发读取扣次、撤销或
+    # 换发提交之后，identity map 里的旧状态会让失效凭证被误判为有效。
+    read_token = db.execute(
+        select(ReadToken)
+        .where(ReadToken.token == token)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).scalar_one_or_none()
+    read_bundle: ReadBundle | None = None
+    if read_token is None:
+        read_bundle = db.execute(
+            select(ReadBundle)
+            .where(ReadBundle.credential == token)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        ).scalar_one_or_none()
+
+    # 当前冻结期行（若存在）：在记录行锁之后获取。解除冻结只更新该行，持锁
+    # 期间本读取在下方等待，因此冻结核对也必须使用获锁后的新状态与新时刻。
     active_freeze = db.execute(
         select(RecordFreeze.id)
         .where(
@@ -2624,74 +2628,100 @@ def read_snapshot(
         .with_for_update()
         .limit(1)
     ).first()
+
+    # 全部相关行锁（快照/记录/凭证/冻结）均已等待结束：此刻读取本请求唯一的
+    # 资格判定时刻 now——等待期间跨过的任何界限（定时撤回到点、冻结/解除提交、
+    # 阅览时段开放/截止、凭证到期）一律按该新时刻判定，绝不使用取锁前的旧时间。
+    now = datetime.now(timezone.utc)
+
+    # 定时撤回计划到点即在快照行锁内惰性结算：若本请求在记录/凭证/冻结行锁上
+    # 等待期间跨过了 scheduled_at，这里以**预定时刻**为撤回时间、**计划原因**
+    # 为原因完成撤回；结算先独立提交（到点即视为撤回，与本次读取成败无关），
+    # 随后本请求按既有“已撤回快照”路径处理——模糊 403、不扣额度、不写成功审计。
+    if snapshot.withdrawn_at is None:
+        _settle_snapshot_withdrawal_plans(db, snapshot, now)
+        if snapshot.withdrawn_at is not None:
+            db.commit()
+            raise _snapshot_unavailable()
+    if snapshot.withdrawn_at is not None:
+        # 已撤回（手动撤回或到点计划；快照锁持有期间并发撤回无法插入，此分支
+        # 覆盖取快照锁前已撤回的情形）：不触碰任何读取计数，也不写审计事件。
+        db.rollback()
+        raise _snapshot_unavailable()
+
+    # 冻结期：冻结操作先锁记录行再插入冻结行，与本读取在记录锁上串行化，冻结
+    # 提交后才获锁的读取在此看到未解除冻结期；解除先提交则此处看不到。冻结
+    # 覆盖该记录现有及冻结期间新发布的全部快照；共享凭证中其他记录不受影响。
     if active_freeze is not None:
         db.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, detail="snapshot unavailable"
-        )
-    now = read_now
-    # 外部阅览时段（随快照首次发布固定）：仅在 [window_open_at, window_close_at)
-    # 内放行，开放时刻起含、截止时刻前不含，以服务端资格判定时刻 now 为准。
-    # 窗口外沿用与撤回/冻结完全一致的模糊 403：不区分原因，不执行任何计数 UPDATE
-    # （不扣单快照令牌或共享凭证次数），不写成功读取审计；时段是每快照属性，
-    # 同凭证清单内其他快照不受影响。无时段快照（两列为 NULL）恒通过本检查。
+        raise _snapshot_unavailable()
+
+    # 外部阅览时段（随快照首次发布固定，不可变）：仅在 [window_open_at,
+    # window_close_at) 内放行，开放时刻起含、截止时刻前不含，以全部行锁等待
+    # 结束后的服务端时刻 now 为准——等待跨过开放/截止时按新时刻判定。窗口外
+    # 沿用与撤回/冻结完全一致的模糊 403：不区分原因，不扣次数、不写成功读取
+    # 审计；时段是每快照属性，同凭证清单内其他快照不受影响。无时段快照恒通过。
     if not _window_active(snapshot, now):
         db.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, detail="snapshot unavailable"
-        )
-    # 优先按既有单快照令牌判定（行为与响应完全保持兼容）。
-    # RETURNING chain_id：只有真正完成扣次的成功读取才取回换发链标识并写事件。
-    token_chain_id = db.execute(
-        update(ReadToken)
-        .where(
-            ReadToken.token == token,
-            ReadToken.snapshot_id == snapshot.id,
-            ReadToken.revoked_at.is_(None),
-            ReadToken.rotated_at.is_(None),
-            or_(ReadToken.expires_at.is_(None), ReadToken.expires_at > now),
-            or_(
-                ReadToken.max_reads.is_(None),
-                ReadToken.reads_used < ReadToken.max_reads,
-            ),
-        )
-        .values(reads_used=ReadToken.reads_used + 1)
-        .returning(ReadToken.chain_id)
-    ).scalar_one_or_none()
-    credential_kind = None
-    chain_id = None
-    if token_chain_id is not None:
-        credential_kind, chain_id = AUDIT_KIND_TOKEN, token_chain_id
-    else:
-        # 不是有效的单快照令牌：按多快照共享凭证判定（凭证只能读取清单内快照）。
-        # 成员关系、撤销/换发/到期/额度判定与共享计数递增合并为同一条条件 UPDATE，
-        # 命中行即 reads_used = reads_used + 1：行锁串行化并发读取，
-        # 跨清单的成功次数绝不超过共享上限。
-        bundle_chain_id = db.execute(
-            update(ReadBundle)
-            .where(
-                ReadBundle.credential == token,
-                ReadBundle.revoked_at.is_(None),
-                ReadBundle.rotated_at.is_(None),
-                or_(ReadBundle.expires_at.is_(None), ReadBundle.expires_at > now),
-                ReadBundle.reads_used < ReadBundle.max_reads,
-                ReadBundle.id.in_(
-                    select(ReadBundleItem.bundle_id).where(
-                        ReadBundleItem.snapshot_id == snapshot.id
-                    )
-                ),
+        raise _snapshot_unavailable()
+
+    credential_kind: str | None = None
+    chain_id: UUID | None = None
+    if read_token is not None:
+        # 单快照令牌：在已锁定且刷新过的行上以同一份 now 判定有效性，
+        # 合格则同事务扣次；快照不匹配、撤销、换发、到期或额度耗尽均不扣次。
+        if not (
+            read_token.snapshot_id == snapshot.id
+            and read_token.revoked_at is None
+            and read_token.rotated_at is None
+            and (
+                read_token.expires_at is None or read_token.expires_at > now
             )
-            .values(reads_used=ReadBundle.reads_used + 1)
-            .returning(ReadBundle.chain_id)
-        ).scalar_one_or_none()
-        if bundle_chain_id is None:
+            and (
+                read_token.max_reads is None
+                or read_token.reads_used < read_token.max_reads
+            )
+        ):
             db.rollback()
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN, detail="snapshot unavailable"
+            raise _snapshot_unavailable()
+        read_token.reads_used = read_token.reads_used + 1
+        credential_kind, chain_id = AUDIT_KIND_TOKEN, read_token.chain_id
+    else:
+        # 多快照共享凭证：成员关系、撤销/换发/到期/共享额度在锁定的凭证行上
+        # 以同一份 now 判定。行锁串行化并发读取，跨清单的成功次数绝不超上限；
+        # 不合格（凭证不存在、快照不在清单、已撤销、已换发、已到期、额度耗尽）
+        # 统一模糊 403，且不消耗共享额度。清单项不可变，普通读核对即可。
+        in_bundle = (
+            read_bundle is not None
+            and db.execute(
+                select(ReadBundleItem.bundle_id)
+                .where(
+                    ReadBundleItem.bundle_id == read_bundle.id,
+                    ReadBundleItem.snapshot_id == snapshot.id,
+                )
+                .limit(1)
+            ).first()
+            is not None
+        )
+        if not in_bundle:
+            db.rollback()
+            raise _snapshot_unavailable()
+        assert read_bundle is not None
+        if (
+            read_bundle.revoked_at is not None
+            or read_bundle.rotated_at is not None
+            or (
+                read_bundle.expires_at is not None
+                and read_bundle.expires_at <= now
             )
-        credential_kind, chain_id = AUDIT_KIND_BUNDLE, bundle_chain_id
+            or read_bundle.reads_used >= read_bundle.max_reads
+        ):
+            db.rollback()
+            raise _snapshot_unavailable()
+        read_bundle.reads_used = read_bundle.reads_used + 1
+        credential_kind, chain_id = AUDIT_KIND_BUNDLE, read_bundle.chain_id
     # 成功读取：审计事件与本次额度扣减在同一事务提交（原子）。
-    # 只记录稳定换发链标识，不记录令牌/共享凭证字符串本身。
+    # 事件时间取行锁等待结束后的 now；只记录稳定换发链标识，绝不记录凭证字符串。
     db.add(
         ReadAuditEvent(
             snapshot_id=snapshot.id,
@@ -2707,6 +2737,13 @@ def read_snapshot(
         "status": SNAPSHOT_STATUS,
         "redacted_text": snapshot.redacted_text,
     }
+
+
+def _snapshot_unavailable() -> HTTPException:
+    """公开读取统一的模糊 403：不透露具体失效原因（撤回/冻结/窗口/凭证等）。"""
+    return HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN, detail="snapshot unavailable"
+    )
 
 
 # ---- 成功读取审计事件的维护侧分页查询（只追加日志，无修改/删除入口） ----

@@ -4190,6 +4190,449 @@ class SnapshotReadingWindowIntegrationTests(unittest.TestCase):
         self.assertEqual(status["reads_used"], 3)
 
 
+@unittest.skipIf(SKIP_INTEGRATION, _SKIP_REASON)
+class PublicReadLockWaitBoundaryIntegrationTests(unittest.TestCase):
+    """公开读取在相关行锁上等待并跨过界限：按获锁后的服务端时刻重新判定。
+
+    旧实现取得快照锁后立即缓存服务端时间，随后等待记录/冻结/凭证行锁期间可能
+    跨过阅览时段截止、凭证到期或定时撤回计划到点；旧时间会让已失效读取错误地
+    返回脱敏正文、扣减额度并写入成功审计。本组用协调线程持锁使读取在各阶段
+    阻塞，验证修复后统一模糊 403、不扣次、不写成功审计；计划到点仍按预定时刻
+    与计划原因完成撤回。
+    """
+
+    HOLD_SECONDS = 1.3
+
+    @classmethod
+    def setUpClass(cls):
+        app_main._init_db_with_retry()
+        cls.client = TestClient(app_main.app)
+        cls.client.__enter__()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.client.__exit__(None, None, None)
+
+    # ---- 工具方法 ----
+
+    def _create_record(self):
+        r = self.client.post(
+            "/records",
+            headers=SERVICE_HEADERS,
+            json={"text": TEXT_V1, "intervals": INTERVALS_V1},
+        )
+        self.assertEqual(r.status_code, 201, r.text)
+        return r.json()["record_id"]
+
+    def _publish(self, record_id, extra=None):
+        body = {"version": 1}
+        if extra:
+            body.update(extra)
+        r = self.client.post(
+            f"/records/{record_id}/publish",
+            headers=SERVICE_HEADERS,
+            json=body,
+        )
+        self.assertEqual(r.status_code, 201, r.text)
+        return r.json()
+
+    def _approved_bundle(self, snapshot_ids, max_reads=10, extra=None):
+        body = {"snapshot_ids": snapshot_ids, "max_reads": max_reads}
+        if extra:
+            body.update(extra)
+        s = self.client.post("/bundle-requests", auth=BASIC_ALICE, json=body)
+        self.assertEqual(s.status_code, 201, s.text)
+        a = self.client.post(
+            f"/bundle-requests/{s.json()['request_id']}/approve", auth=BASIC_BOB
+        )
+        self.assertEqual(a.status_code, 200, a.text)
+        return a.json()
+
+    def _read(self, snapshot_id, credential):
+        return self.client.get(
+            f"/public/snapshots/{snapshot_id}?token={credential}"
+        )
+
+    def _token_used(self, token):
+        r = self.client.get(f"/tokens/{token}", headers=SERVICE_HEADERS)
+        self.assertEqual(r.status_code, 200, r.text)
+        return r.json()["reads_used"]
+
+    def _bundle_used(self, bundle_id):
+        r = self.client.get(
+            f"/read-bundles/{bundle_id}", headers=SERVICE_HEADERS
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        return r.json()["reads_used"]
+
+    def _audit_count(self, snapshot_id):
+        from sqlalchemy import text as sql_text
+
+        from app.db import SessionLocal
+
+        with SessionLocal() as session:
+            return session.execute(
+                sql_text(
+                    "SELECT count(*) FROM read_audit_events "
+                    "WHERE snapshot_id = :sid"
+                ),
+                {"sid": str(snapshot_id)},
+            ).scalar_one()
+
+    def _hold_rows(self, *, record=False, read_token=None,
+                   read_bundle=None, delay=HOLD_SECONDS):
+        """工作线程事务中持有指定行 FOR UPDATE 锁 delay 秒后提交，返回 join 用线程。
+
+        公开读取的加锁顺序为 快照 -> 记录 -> 凭证 -> 冻结，故持锁点之前的阶段
+        都已瞬间完成，读取恰好在目标行锁上等待到延迟结束（界限已跨过）。
+        """
+        from sqlalchemy import text as sql_text
+
+        from app.db import SessionLocal
+
+        acquired = threading.Event()
+
+        def hold():
+            session = SessionLocal()
+            try:
+                if record:
+                    session.execute(
+                        sql_text(
+                            "SELECT id FROM records WHERE id = :rid FOR UPDATE"
+                        ),
+                        {"rid": str(getattr(self, "record_id", None))},
+                    )
+                if read_token is not None:
+                    session.execute(
+                        sql_text(
+                            "SELECT token FROM read_tokens WHERE token = :t FOR UPDATE"
+                        ),
+                        {"t": read_token},
+                    )
+                if read_bundle is not None:
+                    session.execute(
+                        sql_text(
+                            "SELECT id FROM read_bundles WHERE credential = :c "
+                            "FOR UPDATE"
+                        ),
+                        {"c": read_bundle},
+                    )
+                acquired.set()
+                time.sleep(delay)
+                session.commit()
+            except Exception:  # pragma: no cover - 仅在异常时暴露
+                session.rollback()
+                raise
+            finally:
+                session.close()
+
+        thread = threading.Thread(target=hold)
+        thread.start()
+        self.assertTrue(acquired.wait(timeout=5), "协调线程未能取得行锁")
+        return thread
+
+    def _hold_record_then_commit_freeze(self, reason, delay=HOLD_SECONDS):
+        """持记录行锁 delay 秒，随后在同一事务插入冻结行并提交。
+
+        公开读取在记录锁上排队到提交之后才获锁，因此必定看到这条未解除冻结期；
+        直接走 SQL 是为了让“持锁等待”与“冻结提交”严格同序，消除调度不确定性。
+        """
+        import uuid as uuid_lib
+
+        from sqlalchemy import text as sql_text
+
+        from app.db import SessionLocal
+
+        done = threading.Event()
+
+        def hold_and_freeze():
+            session = SessionLocal()
+            try:
+                session.execute(
+                    sql_text("SELECT id FROM records WHERE id = :rid FOR UPDATE"),
+                    {"rid": str(self.record_id)},
+                )
+                time.sleep(delay)
+                session.execute(
+                    sql_text(
+                        "INSERT INTO record_freezes (id, record_id, reason) "
+                        "VALUES (:fid, :rid, :reason)"
+                    ),
+                    {
+                        "fid": str(uuid_lib.uuid4()),
+                        "rid": str(self.record_id),
+                        "reason": reason,
+                    },
+                )
+                session.commit()
+                done.set()
+            except Exception:  # pragma: no cover
+                session.rollback()
+                raise
+            finally:
+                session.close()
+
+        thread = threading.Thread(target=hold_and_freeze)
+        thread.start()
+        return thread, done
+
+    # ---- 单快照令牌：行锁等待跨过阅览时段截止 ----
+
+    def test_token_read_waiting_on_record_lock_past_window_close_is_opaque_403(self):
+        record_id = self._create_record()
+        self.record_id = record_id
+        now = datetime.now(timezone.utc)
+        pub = self._publish(
+            record_id,
+            extra={
+                "max_reads": 5,
+                "window_open_at": _iso(now - timedelta(seconds=30)),
+                "window_close_at": _iso(now + timedelta(milliseconds=800)),
+            },
+        )
+        sid, tok = pub["snapshot_id"], pub["token"]
+        # 持记录行锁到时段截止之后：读取拿到快照锁后在记录锁上等待，
+        # 旧实现会用等待前缓存的时间而错误放行。
+        holder = self._hold_rows(record=True)
+        r = self._read(sid, tok)
+        holder.join(timeout=10)
+        self.assertFalse(holder.is_alive())
+        self.assertEqual(r.status_code, 403, r.text)
+        self.assertEqual(r.json()["detail"], "snapshot unavailable")
+        # 不扣次、不写成功审计
+        self.assertEqual(self._token_used(tok), 0)
+        self.assertEqual(self._audit_count(sid), 0)
+
+    def test_token_read_waiting_on_credential_lock_past_window_close_is_opaque_403(self):
+        record_id = self._create_record()
+        self.record_id = record_id
+        now = datetime.now(timezone.utc)
+        pub = self._publish(
+            record_id,
+            extra={
+                "max_reads": 5,
+                "window_open_at": _iso(now - timedelta(seconds=30)),
+                "window_close_at": _iso(now + timedelta(milliseconds=800)),
+            },
+        )
+        sid, tok = pub["snapshot_id"], pub["token"]
+        # 持令牌行锁到时段截止之后：读取在凭证行锁上等待。
+        holder = self._hold_rows(read_token=tok)
+        r = self._read(sid, tok)
+        holder.join(timeout=10)
+        self.assertFalse(holder.is_alive())
+        self.assertEqual(r.status_code, 403, r.text)
+        self.assertEqual(self._token_used(tok), 0)
+        self.assertEqual(self._audit_count(sid), 0)
+
+    # ---- 单快照令牌：行锁等待跨过凭证到期 ----
+
+    def test_token_read_waiting_on_record_lock_past_credential_expiry_is_opaque_403(self):
+        record_id = self._create_record()
+        self.record_id = record_id
+        pub = self._publish(
+            record_id,
+            extra={
+                "max_reads": 5,
+                "expires_in_seconds": 1,
+            },
+        )
+        sid, tok = pub["snapshot_id"], pub["token"]
+        # 无阅览时段；凭证 1 秒后到期，协调线程持记录锁 1.3 秒。
+        holder = self._hold_rows(record=True)
+        r = self._read(sid, tok)
+        holder.join(timeout=10)
+        self.assertFalse(holder.is_alive())
+        self.assertEqual(r.status_code, 403, r.text)
+        self.assertEqual(self._token_used(tok), 0)
+        self.assertEqual(self._audit_count(sid), 0)
+        # 到期后新读取稳定 403
+        self.assertEqual(self._read(sid, tok).status_code, 403)
+
+    # ---- 多快照共享凭证：行锁等待跨过阅览时段截止 / 凭证到期 ----
+
+    def test_bundle_read_waiting_on_record_lock_past_window_close_is_opaque_403(self):
+        record_id = self._create_record()
+        self.record_id = record_id
+        rid2 = self._create_record()
+        now = datetime.now(timezone.utc)
+        window = self._publish(
+            record_id,
+            extra={
+                "window_open_at": _iso(now - timedelta(seconds=30)),
+                "window_close_at": _iso(now + timedelta(milliseconds=800)),
+            },
+        )
+        open_snap = self._publish(rid2)
+        bundle = self._approved_bundle(
+            [window["snapshot_id"], open_snap["snapshot_id"]], max_reads=5
+        )
+        cred, bid = bundle["credential"], bundle["bundle_id"]
+        # 持“窗口快照”的记录行锁到截止之后：读取在记录锁上等待。
+        holder = self._hold_rows(record=True)
+        r = self._read(window["snapshot_id"], cred)
+        holder.join(timeout=10)
+        self.assertFalse(holder.is_alive())
+        self.assertEqual(r.status_code, 403, r.text)
+        # 不扣共享额度、不写成功审计；清单内另一快照仍可读
+        self.assertEqual(self._bundle_used(bid), 0)
+        self.assertEqual(self._audit_count(window["snapshot_id"]), 0)
+        r2 = self._read(open_snap["snapshot_id"], cred)
+        self.assertEqual(r2.status_code, 200, r2.text)
+        self.assertEqual(self._bundle_used(bid), 1)
+
+    def test_bundle_read_waiting_on_credential_lock_past_credential_expiry_is_opaque_403(self):
+        record_id = self._create_record()
+        self.record_id = record_id
+        rid2 = self._create_record()
+        snap1 = self._publish(record_id)
+        snap2 = self._publish(rid2)
+        bundle = self._approved_bundle(
+            [snap1["snapshot_id"], snap2["snapshot_id"]],
+            max_reads=5,
+            extra={"expires_in_seconds": 1},
+        )
+        cred, bid = bundle["credential"], bundle["bundle_id"]
+        # 持凭证行锁到凭证到期之后：两项读取在凭证锁上等待后都应模糊 403。
+        holder = self._hold_rows(read_bundle=cred)
+        r = self._read(snap1["snapshot_id"], cred)
+        holder.join(timeout=10)
+        self.assertFalse(holder.is_alive())
+        self.assertEqual(r.status_code, 403, r.text)
+        self.assertEqual(self._read(snap2["snapshot_id"], cred).status_code, 403)
+        self.assertEqual(self._bundle_used(bid), 0)
+        self.assertEqual(self._audit_count(snap1["snapshot_id"]), 0)
+
+    # ---- 行锁等待跨过定时撤回计划到点：按预定时刻/计划原因撤回，读取 403 ----
+
+    def test_token_read_waiting_past_plan_due_settles_then_opaque_403_without_consume(self):
+        from sqlalchemy import text as sql_text
+
+        from app.db import SessionLocal
+
+        record_id = self._create_record()
+        self.record_id = record_id
+        pub = self._publish(record_id, extra={"max_reads": 5})
+        sid, tok = pub["snapshot_id"], pub["token"]
+        target = datetime.now(timezone.utc) + timedelta(milliseconds=800)
+        plan = self.client.post(
+            "/snapshot-withdrawal-plans",
+            headers=SERVICE_HEADERS,
+            json={
+                "snapshot_id": sid,
+                "scheduled_at": _iso(target),
+                "reason": "锁等待期间到点撤回",
+            },
+        )
+        self.assertEqual(plan.status_code, 201, plan.text)
+        plan_id = plan.json()["plan_id"]
+        # 停掉后台结算，使到点只能由读取事务在获锁后惰性结算。
+        app_main._withdrawal_scheduler.stop()
+        try:
+            # 记录行锁持有到计划到点之后：读取在记录锁上等待，拿到锁后必须以
+            # 新时刻结算计划（预定时刻/计划原因）再拒绝，而不是用旧时间放行。
+            holder = self._hold_rows(record=True)
+            r = self._read(sid, tok)
+            holder.join(timeout=10)
+            self.assertFalse(holder.is_alive())
+        finally:
+            app_main._withdrawal_scheduler.start()
+        self.assertEqual(r.status_code, 403, r.text)
+        # 计划已按预定时刻与计划原因完成撤回
+        got = self.client.get(
+            f"/snapshot-withdrawal-plans/{plan_id}", headers=SERVICE_HEADERS
+        ).json()
+        self.assertEqual(got["status"], "completed")
+        withdrawn_at = datetime.fromisoformat(got["withdrawn_at"])
+        self.assertLess(abs((withdrawn_at - target).total_seconds()), 2.0)
+        snap = self.client.get(
+            f"/records/{record_id}", headers=SERVICE_HEADERS
+        ).json()["snapshots"][0]
+        self.assertEqual(snap["status"], "withdrawn")
+        self.assertEqual(snap["withdraw_reason"], "锁等待期间到点撤回")
+        # 不扣次、不写成功审计；之后的新读取稳定 403
+        self.assertEqual(self._token_used(tok), 0)
+        self.assertEqual(self._audit_count(sid), 0)
+        self.assertEqual(self._read(sid, tok).status_code, 403)
+        with SessionLocal() as session:
+            settled_reason = session.execute(
+                sql_text(
+                    "SELECT withdraw_reason FROM snapshots WHERE id = :sid"
+                ),
+                {"sid": str(sid)},
+            ).scalar_one()
+        self.assertEqual(settled_reason, "锁等待期间到点撤回")
+
+    def test_bundle_read_waiting_past_plan_due_settles_then_opaque_403_without_consume(self):
+        record_id = self._create_record()
+        self.record_id = record_id
+        rid2 = self._create_record()
+        snap1 = self._publish(record_id, extra={"max_reads": None})
+        snap2 = self._publish(rid2)
+        bundle = self._approved_bundle(
+            [snap1["snapshot_id"], snap2["snapshot_id"]], max_reads=5
+        )
+        cred, bid = bundle["credential"], bundle["bundle_id"]
+        target = datetime.now(timezone.utc) + timedelta(milliseconds=800)
+        plan = self.client.post(
+            "/snapshot-withdrawal-plans",
+            headers=SERVICE_HEADERS,
+            json={
+                "snapshot_id": snap1["snapshot_id"],
+                "scheduled_at": _iso(target),
+                "reason": "共享凭证锁等待期间到点",
+            },
+        )
+        self.assertEqual(plan.status_code, 201, plan.text)
+        plan_id = plan.json()["plan_id"]
+        app_main._withdrawal_scheduler.stop()
+        try:
+            holder = self._hold_rows(record=True)
+            r = self._read(snap1["snapshot_id"], cred)
+            holder.join(timeout=10)
+            self.assertFalse(holder.is_alive())
+        finally:
+            app_main._withdrawal_scheduler.start()
+        self.assertEqual(r.status_code, 403, r.text)
+        got = self.client.get(
+            f"/snapshot-withdrawal-plans/{plan_id}", headers=SERVICE_HEADERS
+        ).json()
+        self.assertEqual(got["status"], "completed")
+        # 不扣共享额度、不写成功审计；清单内另一快照仍可读
+        self.assertEqual(self._bundle_used(bid), 0)
+        self.assertEqual(self._audit_count(snap1["snapshot_id"]), 0)
+        self.assertEqual(self._read(snap1["snapshot_id"], cred).status_code, 403)
+        self.assertEqual(self._read(snap2["snapshot_id"], cred).status_code, 200)
+        self.assertEqual(self._bundle_used(bid), 1)
+
+    # ---- 行锁等待期间记录被冻结：获锁后看到冻结期，模糊 403 ----
+
+    def test_token_read_waiting_on_record_lock_sees_freeze_committed_during_wait(self):
+        record_id = self._create_record()
+        self.record_id = record_id
+        pub = self._publish(record_id, extra={"max_reads": 5})
+        sid, tok = pub["snapshot_id"], pub["token"]
+        # 协调事务持有记录行锁，随后在同一事务插入冻结行并提交：读取在记录锁上
+        # 排队到提交之后才获锁，必须看到未解除冻结期并模糊 403（不扣次、不审计）。
+        holder, freeze_done = self._hold_record_then_commit_freeze(
+            "读取等待期间冻结"
+        )
+        r = self._read(sid, tok)
+        holder.join(timeout=10)
+        self.assertFalse(holder.is_alive())
+        self.assertTrue(freeze_done.wait(timeout=5))
+        self.assertEqual(r.status_code, 403, r.text)
+        self.assertEqual(r.json()["detail"], "snapshot unavailable")
+        self.assertEqual(self._token_used(tok), 0)
+        self.assertEqual(self._audit_count(sid), 0)
+        # 冻结原因只在维护侧可见
+        status_ = self.client.get(
+            f"/records/{record_id}/freeze", headers=SERVICE_HEADERS
+        ).json()
+        self.assertTrue(status_["frozen"])
+        self.assertEqual(status_["reason"], "读取等待期间冻结")
+
+
 class VersionOriginalDestructionIntegrationTests(unittest.TestCase):
     """历史版本原文销毁：原子清除、幂等回放、销毁后发布/申请/批准拒绝、其余约定不变。"""
 
